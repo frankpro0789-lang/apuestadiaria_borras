@@ -2,7 +2,7 @@ import requests
 import os
 from datetime import datetime
 
-# ─── TUS CLAVES (vienen de Railway, no las toques aquí) ──────────
+# ─── TUS CLAVES ──────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 ODDS_API_KEY = os.environ["ODDS_API_KEY"]
@@ -10,7 +10,6 @@ RAPIDAPI_KEY = os.environ["RAPIDAPI_KEY"]
 
 # ─── LIGAS A ANALIZAR ────────────────────────────────────────────
 LIGAS = [
-    # Masculinas secundarias europeas
     "soccer_england_championship",
     "soccer_germany_bundesliga2",
     "soccer_italy_serie_b",
@@ -18,7 +17,6 @@ LIGAS = [
     "soccer_spain_segunda_division",
     "soccer_netherlands_eredivisie",
     "soccer_belgium_first_div",
-    # Femeninas
     "soccer_england_womens_super_league",
     "soccer_germany_frauen_bundesliga",
     "soccer_france_womens_d1",
@@ -27,19 +25,20 @@ LIGAS = [
     "soccer_usa_nwsl",
 ]
 
-UMBRAL_EV = 0.05  # Mínimo 5% de valor esperado para recomendar
+UMBRAL_EV = 0.05       # 5% → pick con valor real
+UMBRAL_EV_MINIMO = -0.10  # -10% → por debajo de esto ni se menciona
 
 # ─── FUNCIONES ───────────────────────────────────────────────────
 
 def obtener_cuotas():
-    """Recoge todos los partidos de hoy con cuotas de Bet365"""
     partidos = []
+    mercados = "h2h,totals,corners"
     for liga in LIGAS:
         url = f"https://api.the-odds-api.com/v4/sports/{liga}/odds/"
         params = {
             "apiKey": ODDS_API_KEY,
             "regions": "eu",
-            "markets": "h2h",
+            "markets": mercados,
             "bookmakers": "bet365",
             "dateFormat": "iso",
         }
@@ -55,7 +54,6 @@ def obtener_cuotas():
     return partidos
 
 def nombre_liga(key):
-    """Convierte el código técnico de la liga en un nombre legible"""
     nombres = {
         "soccer_england_championship": "Championship 🏴󠁧󠁢󠁥󠁮󠁧󠁿",
         "soccer_germany_bundesliga2": "Bundesliga 2 🇩🇪",
@@ -74,19 +72,9 @@ def nombre_liga(key):
     return nombres.get(key, key)
 
 def calcular_ev(prob_real, cuota):
-    """
-    Valor Esperado = (probabilidad real × cuota) - 1
-    Si es mayor que 0 → hay valor
-    Ejemplo: prob 40% × cuota 3.00 = 1.20 → EV = +20%
-    """
     return (prob_real * cuota) - 1
 
 def estimar_probabilidades(local, visitante):
-    """
-    Estima la probabilidad real de cada resultado
-    usando la forma reciente de ambos equipos.
-    Si la API falla, usa probabilidades neutras estándar.
-    """
     url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
@@ -98,7 +86,7 @@ def estimar_probabilidades(local, visitante):
             params = {"team": nombre_equipo, "last": 5}
             r = requests.get(url, headers=headers, params=params, timeout=10)
             if r.status_code != 200:
-                return 7  # valor neutro (47% victorias)
+                return 7
             partidos = r.json().get("response", [])
             puntos = 0
             for p in partidos:
@@ -115,33 +103,51 @@ def estimar_probabilidades(local, visitante):
         except Exception:
             return 7
 
+    def goles_recientes(nombre_equipo):
+        try:
+            params = {"team": nombre_equipo, "last": 5}
+            r = requests.get(url, headers=headers, params=params, timeout=10)
+            if r.status_code != 200:
+                return 1.3
+            partidos = r.json().get("response", [])
+            total_goles = 0
+            for p in partidos:
+                goals = p.get("goals", {})
+                total_goles += (goals.get("home") or 0) + (goals.get("away") or 0)
+            return total_goles / max(len(partidos), 1)
+        except Exception:
+            return 1.3
+
     pts_local = puntos_recientes(local)
     pts_visitante = puntos_recientes(visitante)
     total = pts_local + pts_visitante + 0.001
 
-    # Ventaja de jugar en casa: +8%
     prob_local = min((pts_local / total) * 0.85 + 0.08, 0.75)
     prob_visitante = min((pts_visitante / total) * 0.85, 0.65)
     prob_empate = max(1 - prob_local - prob_visitante, 0.08)
-
-    # Renormalizar para que sumen exactamente 1
     suma = prob_local + prob_empate + prob_visitante
+
+    goles_local = goles_recientes(local)
+    goles_visitante = goles_recientes(visitante)
+    promedio_goles = (goles_local + goles_visitante) / 2
+
+    prob_over25 = min(max((promedio_goles - 1.5) / 2, 0.25), 0.80)
+    prob_under25 = 1 - prob_over25
+
     return {
         "local": round(prob_local / suma, 3),
         "empate": round(prob_empate / suma, 3),
         "visitante": round(prob_visitante / suma, 3),
+        "over25": round(prob_over25, 3),
+        "under25": round(prob_under25, 3),
+        "over95_corners": 0.52,
+        "under95_corners": 0.48,
     }
 
 def analizar_partidos(partidos):
-    """
-    Para cada partido:
-    1. Coge las cuotas de Bet365
-    2. Estima las probabilidades reales
-    3. Calcula el EV de cada resultado
-    4. Si EV > 5% → pick con valor
-    """
     picks_con_valor = []
-    sin_valor = []
+    picks_sin_valor = []  # los mejores aunque no tengan valor
+    sin_valor_nombres = []
 
     for partido in partidos[:25]:
         try:
@@ -156,100 +162,121 @@ def analizar_partidos(partidos):
             if not bet365:
                 continue
 
-            mercados = bet365["markets"][0]["outcomes"]
-            cuotas = {o["name"]: o["price"] for o in mercados}
-
-            cuota_local = cuotas.get(local, 0)
-            cuota_empate = cuotas.get("Draw", 0)
-            cuota_visitante = cuotas.get(visitante, 0)
-
-            if not all([cuota_local, cuota_empate, cuota_visitante]):
-                continue
-
             probs = estimar_probabilidades(local, visitante)
-
-            opciones = [
-                ("🏠 Gana " + local, cuota_local, probs["local"]),
-                ("🤝 Empate", cuota_empate, probs["empate"]),
-                ("✈️ Gana " + visitante, cuota_visitante, probs["visitante"]),
-            ]
-
             hay_valor = False
-            for nombre, cuota, prob in opciones:
-                ev = calcular_ev(prob, cuota)
-                if ev >= UMBRAL_EV:
-                    picks_con_valor.append({
+            mejor_ev_partido = -999
+            mejor_pick_partido = None
+
+            for mercado in bet365["markets"]:
+                tipo = mercado["key"]
+                outcomes = mercado["outcomes"]
+                opciones = []
+
+                if tipo == "h2h":
+                    cuotas = {o["name"]: o["price"] for o in outcomes}
+                    cuota_local = cuotas.get(local, 0)
+                    cuota_empate = cuotas.get("Draw", 0)
+                    cuota_visitante = cuotas.get(visitante, 0)
+                    if all([cuota_local, cuota_empate, cuota_visitante]):
+                        opciones = [
+                            ("🏠 Gana " + local, cuota_local, probs["local"], "Resultado"),
+                            ("🤝 Empate", cuota_empate, probs["empate"], "Resultado"),
+                            ("✈️ Gana " + visitante, cuota_visitante, probs["visitante"], "Resultado"),
+                        ]
+
+                elif tipo == "totals":
+                    for o in outcomes:
+                        if o.get("point", 0) == 2.5:
+                            if o["name"] == "Over":
+                                opciones.append(("⚽ Más de 2.5 goles", o["price"], probs["over25"], "Goles"))
+                            elif o["name"] == "Under":
+                                opciones.append(("⚽ Menos de 2.5 goles", o["price"], probs["under25"], "Goles"))
+
+                elif tipo == "corners":
+                    for o in outcomes:
+                        if o.get("point", 0) == 9.5:
+                            if o["name"] == "Over":
+                                opciones.append(("🚩 Más de 9.5 córners", o["price"], probs["over95_corners"], "Córners"))
+                            elif o["name"] == "Under":
+                                opciones.append(("🚩 Menos de 9.5 córners", o["price"], probs["under95_corners"], "Córners"))
+
+                for nombre, cuota, prob, categoria in opciones:
+                    ev = calcular_ev(prob, cuota)
+                    pick = {
                         "partido": f"{local} vs {visitante}",
                         "liga": nombre_liga(liga),
                         "mercado": nombre,
+                        "categoria": categoria,
                         "cuota": cuota,
                         "prob_real": round(prob * 100, 1),
                         "ev": round(ev * 100, 1),
-                    })
-                    hay_valor = True
+                    }
+                    if ev >= UMBRAL_EV:
+                        picks_con_valor.append(pick)
+                        hay_valor = True
+                    elif ev > mejor_ev_partido and ev >= UMBRAL_EV_MINIMO:
+                        mejor_ev_partido = ev
+                        mejor_pick_partido = pick
 
             if not hay_valor:
-                sin_valor.append(f"{local} vs {visitante}")
+                sin_valor_nombres.append(f"{local} vs {visitante}")
+                if mejor_pick_partido:
+                    picks_sin_valor.append(mejor_pick_partido)
 
         except Exception:
             continue
 
     picks_con_valor.sort(key=lambda x: x["ev"], reverse=True)
-    return picks_con_valor[:5], sin_valor
+    picks_sin_valor.sort(key=lambda x: x["ev"], reverse=True)
+    return picks_con_valor[:5], picks_sin_valor[:3], sin_valor_nombres
 
-def explicar_pick(pick, es_el_mejor=False):
-    """
-    Explica cada pick en lenguaje completamente sencillo.
-    Sin tecnicismos, como si se lo contaras a un amigo.
-    """
-    partido = pick["partido"]
-    mercado = pick["mercado"]
-    cuota = pick["cuota"]
-    prob = pick["prob_real"]
+def explicar_pick(pick, es_el_mejor=False, es_sin_valor=False):
     ev = pick["ev"]
-    liga = pick["liga"]
 
-    if ev >= 20:
+    if es_sin_valor:
+        if ev >= 0:
+            nivel = "⚠️ SIN VALOR CLARO"
+            explicacion = "La cuota es aproximadamente justa pero no hay ventaja real. Apuesta con precaución y cantidad pequeña."
+        else:
+            nivel = "⚠️ VALOR NEGATIVO"
+            explicacion = f"Bet365 paga menos de lo que debería ({abs(ev)}% menos). No es ideal pero es la mejor opción disponible hoy si quieres apostar."
+    elif ev >= 20:
         nivel = "🔥 VALOR MUY ALTO"
-        explicacion_ev = f"Por cada 10€ apostados, matemáticamente deberías ganar {round(ev/10, 1)}€ a largo plazo."
+        explicacion = f"Por cada 10€ apostados, matemáticamente deberías ganar {round(ev/10, 1)}€ a largo plazo."
     elif ev >= 10:
         nivel = "✅ VALOR ALTO"
-        explicacion_ev = f"La cuota paga bastante más de lo que debería. Hay margen claro de beneficio."
+        explicacion = "La cuota paga bastante más de lo que debería. Hay margen claro de beneficio."
     else:
         nivel = "👍 VALOR MODERADO"
-        explicacion_ev = f"La cuota es algo mejor de lo justo. Vale la pena pero sin exagerar la apuesta."
+        explicacion = "La cuota es algo mejor de lo justo. Vale la pena pero sin exagerar la apuesta."
 
     estrella = "⭐ MEJOR APUESTA DEL DÍA\n" if es_el_mejor else ""
 
     return (
         f"{estrella}"
-        f"*{partido}*\n"
-        f"🏆 Liga: {liga}\n"
-        f"📌 Qué apostamos: {mercado}\n"
-        f"💰 Cuota en Bet365: {cuota}\n"
-        f"📊 Probabilidad real estimada: {prob}%\n"
-        f"📈 Nivel de valor: {nivel} (+{ev}%)\n"
-        f"💡 En cristiano: {explicacion_ev}\n"
+        f"*{pick['partido']}*\n"
+        f"🏆 Liga: {pick['liga']}\n"
+        f"📌 Mercado: {pick['mercado']}\n"
+        f"💰 Cuota Bet365: {pick['cuota']}\n"
+        f"📊 Probabilidad real estimada: {pick['prob_real']}%\n"
+        f"📈 Nivel: {nivel} ({'+' if ev >= 0 else ''}{ev}%)\n"
+        f"💡 En cristiano: {explicacion}\n"
     )
 
-def construir_mensaje(picks, sin_valor):
-    """
-    Construye el mensaje completo que recibirás en Telegram.
-    """
+def construir_mensaje(picks, picks_sin_valor, sin_valor_nombres):
     hoy = datetime.now().strftime("%A %d de %B de %Y").upper()
-    total = len(picks) + len(sin_valor)
+    total = len(picks) + len(sin_valor_nombres)
     lineas = [
         f"🎯 *ANÁLISIS DE APUESTAS*",
         f"📅 {hoy}\n",
     ]
 
+    # ── PICKS CON VALOR REAL ──
     if picks:
-        lineas.append(f"✅ *{len(picks)} PICKS CON VALOR ENCONTRADOS HOY:*\n")
+        lineas.append(f"✅ *{len(picks)} PICKS CON VALOR REAL HOY:*\n")
         for i, pick in enumerate(picks):
-            es_mejor = (i == 0)
-            lineas.append(explicar_pick(pick, es_el_mejor=es_mejor))
+            lineas.append(explicar_pick(pick, es_el_mejor=(i == 0)))
 
-        # La apuesta más recomendable del día
         mejor = picks[0]
         lineas.append("─" * 30)
         lineas.append(
@@ -257,26 +284,39 @@ def construir_mensaje(picks, sin_valor):
             f"Partido: *{mejor['partido']}*\n"
             f"Qué hacer: Apostar a *{mejor['mercado']}*\n"
             f"Cuota: *{mejor['cuota']}* en Bet365\n"
-            f"Por qué: De todos los partidos analizados hoy, "
+            f"Por qué: De todos los partidos analizados hoy "
             f"este tiene el mayor desfase entre lo que paga Bet365 "
-            f"y lo que realmente merece el partido. "
-            f"Un valor esperado de +{mejor['ev']}% significa que "
-            f"la casa de apuestas está pagando más de lo que debería "
-            f"→ eso es exactamente lo que buscamos.\n"
-        )
-    else:
-        lineas.append(
-            "⛔ *HOY NO HAY PICKS CON VALOR*\n\n"
-            "He revisado todos los partidos disponibles y las cuotas "
-            "de Bet365 no compensan el riesgo real en ningún caso. "
-            "Mejor no apostar hoy. Mañana habrá más oportunidades.\n"
+            f"y lo que realmente merece. "
+            f"Valor esperado de +{mejor['ev']}% → Bet365 está pagando "
+            f"más de lo que debería. Eso es exactamente lo que buscamos.\n"
         )
 
-    if sin_valor:
+    # ── SIN VALOR REAL PERO LAS MEJORES DEL DÍA ──
+    else:
+        lineas.append(
+            "⛔ *HOY NO HAY PICKS CON VALOR REAL*\n"
+            "He revisado todos los partidos y las cuotas de Bet365 "
+            "no compensan el riesgo en ningún caso.\n"
+        )
+
+    if picks_sin_valor:
         lineas.append("─" * 30)
-        lineas.append(f"❌ *PARTIDOS ANALIZADOS SIN VALOR ({len(sin_valor)}):*")
-        lineas.append(", ".join(sin_valor))
-        lineas.append("_(Las cuotas de estos partidos no son suficientemente buenas)_\n")
+        lineas.append(
+            "⚠️ *LAS MEJORES OPCIONES DE HOY "
+            "(sin valor real, apostar con cuidado):*\n"
+            "_Estas apuestas no cumplen el criterio de valor mínimo "
+            "pero son las menos malas del día. "
+            "Si decides apostar, hazlo con cantidades pequeñas._\n"
+        )
+        for pick in picks_sin_valor:
+            lineas.append(explicar_pick(pick, es_sin_valor=True))
+
+    # ── PARTIDOS SIN NADA RECOMENDABLE ──
+    if sin_valor_nombres:
+        lineas.append("─" * 30)
+        lineas.append(f"❌ *PARTIDOS DESCARTADOS HOY ({len(sin_valor_nombres)}):*")
+        lineas.append(", ".join(sin_valor_nombres))
+        lineas.append("_(Cuotas muy por debajo de lo que merece el partido)_\n")
 
     lineas.append("─" * 30)
     lineas.append(f"📊 Total partidos analizados hoy: *{total}*")
@@ -289,7 +329,6 @@ def construir_mensaje(picks, sin_valor):
     return "\n".join(lineas)
 
 def enviar_telegram(mensaje):
-    """Envía el mensaje a tu Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -298,17 +337,17 @@ def enviar_telegram(mensaje):
     }
     requests.post(url, data=data)
 
-# ─── EJECUCIÓN ───────────────────────────────────────────────────
 if __name__ == "__main__":
     print("🔍 Recogiendo partidos del día...")
     partidos = obtener_cuotas()
     print(f"   → {len(partidos)} partidos encontrados")
 
     print("🧮 Calculando valor esperado...")
-    picks, sin_valor = analizar_partidos(partidos)
-    print(f"   → {len(picks)} picks con valor detectados")
+    picks, picks_sin_valor, sin_valor_nombres = analizar_partidos(partidos)
+    print(f"   → {len(picks)} picks con valor real")
+    print(f"   → {len(picks_sin_valor)} opciones sin valor pero recomendables")
 
     print("📱 Enviando a Telegram...")
-    mensaje = construir_mensaje(picks, sin_valor)
+    mensaje = construir_mensaje(picks, picks_sin_valor, sin_valor_nombres)
     enviar_telegram(mensaje)
     print("✅ ¡Listo!")
