@@ -141,21 +141,19 @@ def estimar_probabilidades(local, visitante):
     }
 
 def analizar_partidos(partidos):
-    """
-    Recoge TODAS las opciones de todos los partidos,
-    las ordena por EV de mayor a menor,
-    y devuelve siempre las 5 mejores pase lo que pase.
-    """
     todas_las_opciones = []
 
     for partido in partidos[:25]:
         try:
-            local = partido["home_team"]
-            visitante = partido["away_team"]
+            local = partido.get("home_team", "")
+            visitante = partido.get("away_team", "")
             liga = partido.get("liga_key", "")
 
+            if not local or not visitante:
+                continue
+
             bet365 = next(
-                (b for b in partido.get("bookmakers", []) if b["key"] == "bet365"),
+                (b for b in partido.get("bookmakers", []) if b.get("key") == "bet365"),
                 None
             )
             if not bet365:
@@ -163,13 +161,17 @@ def analizar_partidos(partidos):
 
             probs = estimar_probabilidades(local, visitante)
 
-            for mercado in bet365["markets"]:
-                tipo = mercado["key"]
-                outcomes = mercado["outcomes"]
+            for mercado in bet365.get("markets", []):
+                tipo = mercado.get("key", "")
+                outcomes = mercado.get("outcomes", [])
+
+                if not outcomes:
+                    continue
+
                 opciones = []
 
                 if tipo == "h2h":
-                    cuotas = {o["name"]: o["price"] for o in outcomes}
+                    cuotas = {o["name"]: o["price"] for o in outcomes if "name" in o and "price" in o}
                     cuota_local = cuotas.get(local, 0)
                     cuota_empate = cuotas.get("Draw", 0)
                     cuota_visitante = cuotas.get(visitante, 0)
@@ -183,17 +185,17 @@ def analizar_partidos(partidos):
                 elif tipo == "totals":
                     for o in outcomes:
                         if o.get("point", 0) == 2.5:
-                            if o["name"] == "Over":
+                            if o.get("name") == "Over":
                                 opciones.append(("⚽ Más de 2.5 goles", o["price"], probs["over25"], "Goles"))
-                            elif o["name"] == "Under":
+                            elif o.get("name") == "Under":
                                 opciones.append(("⚽ Menos de 2.5 goles", o["price"], probs["under25"], "Goles"))
 
                 elif tipo == "corners":
                     for o in outcomes:
                         if o.get("point", 0) == 9.5:
-                            if o["name"] == "Over":
+                            if o.get("name") == "Over":
                                 opciones.append(("🚩 Más de 9.5 córners", o["price"], probs["over95_corners"], "Córners"))
-                            elif o["name"] == "Under":
+                            elif o.get("name") == "Under":
                                 opciones.append(("🚩 Menos de 9.5 córners", o["price"], probs["under95_corners"], "Córners"))
 
                 for nombre, cuota, prob, categoria in opciones:
@@ -212,13 +214,8 @@ def analizar_partidos(partidos):
         except Exception:
             continue
 
-    # Ordenar todas por EV de mayor a menor
     todas_las_opciones.sort(key=lambda x: x["ev"], reverse=True)
-
-    # Coger siempre las 5 mejores
-    top5 = todas_las_opciones[:5]
-
-    return top5
+    return todas_las_opciones[:5]
 
 def etiqueta_pick(pick, numero):
     ev = pick["ev"]
@@ -261,7 +258,6 @@ def etiqueta_pick(pick, numero):
 def construir_mensaje(picks):
     hoy = datetime.now().strftime("%A %d de %B de %Y").upper()
     picks_con_valor = [p for p in picks if p["tiene_valor"]]
-    picks_relleno = [p for p in picks if not p["tiene_valor"]]
 
     lineas = [
         f"🎯 *ANÁLISIS DE APUESTAS*",
@@ -276,21 +272,23 @@ def construir_mensaje(picks):
 
     lineas.append("─" * 30 + "\n")
 
-    for i, pick in enumerate(picks, 1):
-        lineas.append(etiqueta_pick(pick, i))
+    if not picks:
+        lineas.append("😔 No se han podido obtener partidos hoy. Inténtalo mañana.")
+    else:
+        for i, pick in enumerate(picks, 1):
+            lineas.append(etiqueta_pick(pick, i))
 
-    # Resumen final — la más recomendable
-    mejor = picks[0]
-    lineas.append("─" * 30)
-    lineas.append(
-        f"⭐ *LA MÁS RECOMENDABLE HOY:*\n"
-        f"Partido: *{mejor['partido']}*\n"
-        f"Apuesta: *{mejor['mercado']}*\n"
-        f"Cuota: *{mejor['cuota']}* en Bet365\n"
-        f"Por qué es la mejor: Tiene el EV más alto de todos los partidos "
-        f"analizados hoy ({'+' if mejor['ev'] >= 0 else ''}{mejor['ev']}%). "
-        f"{'Bet365 está pagando más de lo que debería → ventaja matemática a tu favor.' if mejor['tiene_valor'] else 'Aunque no hay valor perfecto hoy, esta es la menos mala de todas las opciones disponibles.'}\n"
-    )
+        mejor = picks[0]
+        lineas.append("─" * 30)
+        lineas.append(
+            f"⭐ *LA MÁS RECOMENDABLE HOY:*\n"
+            f"Partido: *{mejor['partido']}*\n"
+            f"Apuesta: *{mejor['mercado']}*\n"
+            f"Cuota: *{mejor['cuota']}* en Bet365\n"
+            f"Por qué es la mejor: Tiene el EV más alto de todos los partidos "
+            f"analizados hoy ({'+' if mejor['ev'] >= 0 else ''}{mejor['ev']}%). "
+            f"{'Bet365 está pagando más de lo que debería → ventaja matemática a tu favor.' if mejor['tiene_valor'] else 'Aunque no hay valor perfecto hoy, esta es la menos mala de todas las opciones disponibles.'}\n"
+        )
 
     lineas.append("─" * 30)
     lineas.append("⚠️ _Este análisis es orientativo. Las apuestas conllevan riesgo. Nunca apuestes más de lo que puedes permitirte perder._")
