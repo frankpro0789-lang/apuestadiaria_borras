@@ -5,6 +5,7 @@
   },
   "deploy": {
     "cronSchedule": "0 7 * * *",
-    "restartPolicyType": "NEVER"
+    "restartPolicyType": "NEVER",
+    "startCommand": "python bot.py"
   }
 }
